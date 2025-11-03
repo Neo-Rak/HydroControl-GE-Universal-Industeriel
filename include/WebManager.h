@@ -5,8 +5,9 @@
 
 class WebManager {
 public:
+    WebManager();
     void begin();
-    void notifyClients(const JsonDocument& doc);
+    void notifyClients();
 
 private:
     void setupWebServer();
