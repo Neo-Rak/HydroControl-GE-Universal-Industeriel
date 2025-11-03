@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <vector>
 
 // Enum to define the roles
 enum DeviceRole {
@@ -10,13 +11,22 @@ enum DeviceRole {
   HYDRO_CONTROL_GE
 };
 
+// Enum for the state of a reservoir
+enum ReservoirState {
+    LEVEL_EMPTY,
+    LEVEL_FULL,
+    LEVEL_UNKNOWN
+};
+
 // Data structure for managed devices
 struct Device {
     String id;
     String name;
     DeviceRole role;
     unsigned long lastSeen;
-    bool isFull;
+    ReservoirState level;
     bool pumpOn;
     bool faultActive;
+    String assignedWellId;
+    std::vector<String> assignedReservoirIds;
 };

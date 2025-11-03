@@ -1,13 +1,14 @@
-#pragma once
+#ifndef WEBSERVERMANAGER_H
+#define WEBSERVERMANAGER_H
 
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-class WebServerManager {
+class WebManager {
 public:
-    WebServerManager();
+    WebManager();
     void begin();
-    void notifyClients();
+    void notifyClients(const JsonDocument& doc);
 
 private:
     void setupWebServer();
@@ -16,3 +17,5 @@ private:
     AsyncWebServer server;
     AsyncWebSocket ws;
 };
+
+#endif // WEBSERVERMANAGER_H

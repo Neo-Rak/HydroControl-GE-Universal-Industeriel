@@ -1,12 +1,14 @@
+#include "ThingsBoardManager.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include "ThingsBoardManager.h"
 
 static WiFiClient espClient;
 static PubSubClient client(espClient);
 static unsigned long lastReconnectAttempt = 0;
+
+ThingsBoardManager::ThingsBoardManager() {}
 
 void ThingsBoardManager::begin() {
     loadFromNVS();
@@ -38,7 +40,7 @@ void ThingsBoardManager::setEnabled(bool en) {
 
 void ThingsBoardManager::loadFromNVS() {
     Preferences prefs;
-    prefs.begin("thingsboard", true); // Read-only
+    prefs.begin("thingsboard", true);
     enabled = prefs.getBool("tb_enabled", false);
     tb_server = prefs.getString("tb_server", "");
     tb_port = prefs.getInt("tb_port", 1883);
@@ -48,7 +50,7 @@ void ThingsBoardManager::loadFromNVS() {
 
 void ThingsBoardManager::saveToNVS() {
     Preferences prefs;
-    prefs.begin("thingsboard", false); // Read-write
+    prefs.begin("thingsboard", false);
     prefs.putBool("tb_enabled", enabled);
     prefs.putString("tb_server", tb_server);
     prefs.putInt("tb_port", tb_port);
@@ -60,22 +62,17 @@ void ThingsBoardManager::reconnect() {
     if (!enabled || tb_server.isEmpty() || tb_token.isEmpty() || !WiFi.isConnected()) {
         return;
     }
-    Serial.println("Attempting ThingsBoard MQTT connection...");
     client.setServer(tb_server.c_str(), tb_port);
     if (client.connect("HydroControl-Gateway", tb_token.c_str(), NULL)) {
-        Serial.println("ThingsBoard MQTT connected");
-    } else {
-        Serial.print("MQTT connection failed, rc=");
-        Serial.print(client.state());
+        // Connected
     }
 }
 
 void ThingsBoardManager::loop() {
     if (enabled && WiFi.isConnected()) {
         if (!client.connected()) {
-            unsigned long now = millis();
-            if (now - lastReconnectAttempt > 5000) {
-                lastReconnectAttempt = now;
+            if (millis() - lastReconnectAttempt > 5000) {
+                lastReconnectAttempt = millis();
                 reconnect();
             }
         } else {
@@ -94,10 +91,9 @@ void ThingsBoardManager::sendTelemetry(const String& deviceName, const JsonDocum
     JsonArray ts_values = deviceData["ts"].to<JsonArray>();
 
     JsonObject ts_obj = ts_values.add<JsonObject>();
-    ts_obj["ts"] = millis(); // Add timestamp
+    ts_obj["ts"] = millis();
     JsonObject values_obj = ts_obj["values"].to<JsonObject>();
 
-    // Copy data to the 'values' object
     for (JsonPairConst kvp : data.as<JsonObjectConst>()) {
         values_obj[kvp.key()] = kvp.value();
     }
@@ -105,14 +101,9 @@ void ThingsBoardManager::sendTelemetry(const String& deviceName, const JsonDocum
     String telemetry;
     serializeJson(doc, telemetry);
 
-    if (client.publish("v1/gateway/telemetry", telemetry.c_str())) {
-        Serial.println("Telemetry sent to ThingsBoard for " + deviceName);
-    } else {
-        Serial.println("Failed to send telemetry to ThingsBoard");
-    }
+    client.publish("v1/gateway/telemetry", telemetry.c_str());
 }
 
-// --- Getters ---
 bool ThingsBoardManager::isEnabled() const { return enabled; }
 String ThingsBoardManager::getServer() const { return tb_server; }
 int ThingsBoardManager::getPort() const { return tb_port; }

@@ -1,37 +1,27 @@
 #include "DeviceManager.h"
 #include "config.h"
-#include "types.h"
 #include <ArduinoJson.h>
-#include <map>
-#include <vector>
-#include "ThingsBoardManager.h"
+#include <WiFi.h>
+#include <Preferences.h>
 
-extern DeviceRole currentRole;
-extern String deviceId;
-extern String deviceName;
-extern std::map<String, Device> managedDevices;
-extern std::map<String, std::vector<String>> wellAssignments;
-extern bool discovered;
-extern ThingsBoardManager tbManager;
-extern bool pumpOn;
-extern bool isFull;
-extern bool faultActive;
-
-extern void loraSend(JsonDocument& doc);
-extern void sendPumpCommand(const String& wellId, bool turnOn);
-
-static unsigned long lastHeartbeatSent = 0;
-static unsigned long lastDiscoverySent = 0;
-static unsigned long lastButtonPress = 0;
-static bool lastIsFullState = false;
-static bool lastFaultState = false;
-static bool lastPumpOnState = false;
-static unsigned long lastLogicCheck = 0;
-
-void sendPeripheralStatusUpdate();
-void checkFillingLogic();
+DeviceManager::DeviceManager(LoRaManager& lora) : _lora(lora) {
+    _currentRole = ROLE_NOT_SET;
+    _discovered = false;
+    _lastStatusSent = 0;
+    _lastLogicCheck = 0;
+}
 
 void DeviceManager::begin() {
+    Preferences prefs;
+    prefs.begin("hydro_config", true);
+    _currentRole = (DeviceRole)prefs.getInt("role", ROLE_NOT_SET);
+    _deviceName = prefs.getString("name", "");
+    _deviceId = WiFi.macAddress();
+    prefs.end();
+
+    if (_currentRole == HYDRO_CONTROL_GE) {
+        loadAssignments();
+    }
     setupRole();
 }
 
@@ -39,206 +29,283 @@ void DeviceManager::loop() {
     loopRole();
 }
 
+void DeviceManager::processIncomingLoRaMessage(JsonDocument& doc) {
+    String type = doc["type"];
+    if (type == "DISCOVERY") handleDiscovery(doc);
+    else if (type == "DISCOVERY_ACK") handleDiscoveryAck(doc);
+    else if (type == "HEARTBEAT") handleHeartbeat(doc);
+    else if (type == "STATUS") handleStatus(doc);
+    else if (type == "COMMAND") handleCommand(doc);
+    else if (type == "MANUAL_FILL_REQUEST") handleManualFillRequest(doc);
+    else if (type == "CRITICAL_FAULT") handleCriticalFault(doc);
+}
+
 void DeviceManager::setupRole() {
-    switch (currentRole) {
+    switch (_currentRole) {
         case AQUA_RESERV_PRO:
             pinMode(ROLE_PIN_1, INPUT);
             pinMode(ROLE_PIN_2, INPUT_PULLUP);
-            lastIsFullState = (digitalRead(ROLE_PIN_1) == LOW);
             break;
         case WELLGUARD_PRO:
             pinMode(ROLE_PIN_1, OUTPUT);
             digitalWrite(ROLE_PIN_1, LOW);
             pinMode(ROLE_PIN_2, INPUT_PULLUP);
             pinMode(ROLE_PIN_3, INPUT);
-            lastFaultState = (digitalRead(ROLE_PIN_3) == LOW);
             break;
         case HYDRO_CONTROL_GE:
+            break;
+        default:
             break;
     }
 }
 
 void DeviceManager::loopRole() {
-    switch (currentRole) {
-        case AQUA_RESERV_PRO: loopAquaReservPro(); break;
-        case WELLGUARD_PRO: loopWellguardPro(); break;
-        case HYDRO_CONTROL_GE: loopCentrale(); break;
+    unsigned long now = millis();
+    if (!_discovered && _currentRole != HYDRO_CONTROL_GE) {
+        if (now - _lastDiscoverySent > 10000) {
+            sendDiscovery();
+            _lastDiscoverySent = now;
+        }
     }
-}
 
-void DeviceManager::handleLoraMessage(JsonDocument& doc) {
-    String senderId = doc["id"];
-    String msgType = doc["type"];
-
-    if (currentRole == HYDRO_CONTROL_GE) {
-        if (managedDevices.find(senderId) == managedDevices.end() && msgType == "DISCOVERY") {
-            Device newDevice;
-            newDevice.id = senderId;
-            newDevice.name = doc["payload"]["name"].as<String>();
-            String roleStr = doc["payload"]["role"];
-            if (roleStr == "AquaReservPro") newDevice.role = AQUA_RESERV_PRO;
-            else if (roleStr == "WellguardPro") newDevice.role = WELLGUARD_PRO;
-            managedDevices[senderId] = newDevice;
-        }
-
-        if (managedDevices.count(senderId)) {
-            managedDevices[senderId].lastSeen = millis();
-            if (msgType == "STATUS") {
-                if (managedDevices[senderId].role == AQUA_RESERV_PRO) {
-                    managedDevices[senderId].isFull = (doc["payload"]["level"] == "FULL");
-                } else if (managedDevices[senderId].role == WELLGUARD_PRO) {
-                    managedDevices[senderId].pumpOn = (doc["payload"]["pump"] == "ON");
-                    managedDevices[senderId].faultActive = doc["payload"]["fault"];
-                }
-
-                if (tbManager.isEnabled()) {
-                    JsonDocument telemetry;
-                    JsonObject payload = doc["payload"].as<JsonObject>();
-                    for (JsonPair kv : payload) {
-                        telemetry[kv.key().c_str()] = kv.value();
-                    }
-                    tbManager.sendTelemetry(managedDevices[senderId].name, telemetry);
-                }
-            } else if (msgType == "CRITICAL_FAULT") {
-                managedDevices[senderId].faultActive = true;
-            }
-        }
-    } else { // Peripherals
-        if (msgType == "COMMAND" && currentRole == WELLGUARD_PRO) {
-            bool turnOn = (doc["payload"]["action"] == "PUMP_ON");
-            pumpOn = turnOn;
-            digitalWrite(ROLE_PIN_1, pumpOn ? HIGH : LOW);
-        } else if (msgType == "DISCOVERY_ACK" && doc["payload"]["id"] == deviceId) {
-            discovered = true;
-        }
+    switch (_currentRole) {
+        case AQUA_RESERV_PRO:
+            loopAquaReservPro();
+            break;
+        case WELLGUARD_PRO:
+            loopWellguardPro();
+            break;
+        case HYDRO_CONTROL_GE:
+            loopCentrale();
+            break;
+        default:
+            break;
     }
 }
 
 void DeviceManager::loopAquaReservPro() {
-    unsigned long now = millis();
-    if (!discovered && (now - lastDiscoverySent > 5000)) {
-        JsonDocument doc;
-        doc["type"] = "DISCOVERY";
-        doc["id"] = deviceId;
-        doc["payload"]["name"] = deviceName;
-        doc["payload"]["role"] = "AquaReservPro";
-        loraSend(doc);
-        lastDiscoverySent = now;
+    bool isFull = (digitalRead(ROLE_PIN_1) == LOW);
+    if (isFull != _isFull || millis() - _lastStatusSent > 300000) {
+        _isFull = isFull;
+        sendStatusUpdate();
+        _lastStatusSent = millis();
     }
 
-    bool currentFullState = (digitalRead(ROLE_PIN_1) == LOW);
-    if (currentFullState != lastIsFullState) {
-        lastIsFullState = currentFullState;
-        isFull = currentFullState;
-        sendPeripheralStatusUpdate();
-    }
-
-    if (digitalRead(ROLE_PIN_2) == LOW && (now - lastButtonPress > 1000)) {
-        lastButtonPress = now;
-        JsonDocument doc;
-        doc["type"] = "MANUAL_FILL_REQUEST";
-        doc["id"] = deviceId;
-        loraSend(doc);
-    }
-
-    if (discovered && (now - lastHeartbeatSent > 300000)) {
-        JsonDocument doc;
-        doc["type"] = "HEARTBEAT";
-        doc["id"] = deviceId;
-        loraSend(doc);
-        lastHeartbeatSent = now;
+    if (digitalRead(ROLE_PIN_2) == LOW) {
+        delay(50); // Debounce
+        if (digitalRead(ROLE_PIN_2) == LOW) {
+            JsonDocument doc;
+            doc["from"] = _deviceId;
+            doc["type"] = "MANUAL_FILL_REQUEST";
+            _lora.send(doc);
+        }
     }
 }
 
 void DeviceManager::loopWellguardPro() {
-    unsigned long now = millis();
-    if (!discovered && (now - lastDiscoverySent > 5000)) {
-        JsonDocument doc;
-        doc["type"] = "DISCOVERY";
-        doc["id"] = deviceId;
-        doc["payload"]["name"] = deviceName;
-        doc["payload"]["role"] = "WellguardPro";
-        loraSend(doc);
-        lastDiscoverySent = now;
+    bool fault = (digitalRead(ROLE_PIN_3) == LOW);
+    if (fault && !_faultActive) {
+        _faultActive = true;
+        digitalWrite(ROLE_PIN_1, LOW); // Turn off pump
+        _pumpOn = false;
+        sendStatusUpdate();
+    } else if (!fault && _faultActive) {
+        _faultActive = false;
+        sendStatusUpdate();
     }
 
-    bool currentFaultState = (digitalRead(ROLE_PIN_3) == LOW);
-    if (currentFaultState && !lastFaultState) {
-        lastFaultState = true;
-        faultActive = true;
-        pumpOn = false;
-        digitalWrite(ROLE_PIN_1, LOW);
-        JsonDocument doc;
-        doc["type"] = "CRITICAL_FAULT";
-        doc["id"] = deviceId;
-        loraSend(doc);
-    } else if (!currentFaultState && lastFaultState) {
-        lastFaultState = false;
-        faultActive = false;
+    if (millis() - _lastStatusSent > 300000) {
+        sendStatusUpdate();
+        _lastStatusSent = millis();
     }
 
-    if (pumpOn != lastPumpOnState || lastFaultState != currentFaultState) {
-        sendPeripheralStatusUpdate();
-    }
-    lastPumpOnState = pumpOn;
-    lastFaultState = currentFaultState;
-
-    if (discovered && (now - lastHeartbeatSent > 300000)) {
-        JsonDocument doc;
-        doc["type"] = "HEARTBEAT";
-        doc["id"] = deviceId;
-        loraSend(doc);
-        lastHeartbeatSent = now;
+    if (digitalRead(ROLE_PIN_2) == LOW) {
+        delay(50);
+        if (digitalRead(ROLE_PIN_2) == LOW) {
+            _pumpOn = !_pumpOn;
+            digitalWrite(ROLE_PIN_1, _pumpOn);
+            sendStatusUpdate();
+        }
     }
 }
 
 void DeviceManager::loopCentrale() {
-    unsigned long now = millis();
-    if (now - lastLogicCheck > 5000) {
-        checkFillingLogic();
-        lastLogicCheck = now;
+    if (millis() - _lastLogicCheck > 5000) {
+        checkDeviceTimeouts();
+        runSmartPumpLogic();
+        _lastLogicCheck = millis();
     }
 }
 
-void sendPeripheralStatusUpdate() {
+void DeviceManager::checkDeviceTimeouts() {
+    for (auto it = _managedDevices.begin(); it != _managedDevices.end(); ++it) {
+        if (millis() - it->second.lastSeen > 900000) { // 15 minutes
+            // Mark device as disconnected
+        }
+    }
+}
+
+void DeviceManager::runSmartPumpLogic() {
+    for (auto const& [wellId, wellDevice] : _managedDevices) {
+        if (wellDevice.role == WELLGUARD_PRO) {
+            bool shouldPump = false;
+            for (auto const& reservoirId : wellDevice.assignedReservoirIds) {
+                 if (_managedDevices.count(reservoirId) && _managedDevices[reservoirId].level != LEVEL_FULL) {
+                    shouldPump = true;
+                    break;
+                }
+            }
+            if (wellDevice.pumpOn != shouldPump) {
+                sendPumpCommand(wellId, shouldPump);
+            }
+        }
+    }
+}
+
+void DeviceManager::sendDiscovery() {
     JsonDocument doc;
+    doc["from"] = _deviceId;
+    doc["type"] = "DISCOVERY";
+    doc["role"] = (int)_currentRole;
+    doc["name"] = _deviceName;
+    _lora.send(doc);
+}
+
+void DeviceManager::sendStatusUpdate() {
+    JsonDocument doc;
+    doc["from"] = _deviceId;
     doc["type"] = "STATUS";
-    doc["id"] = deviceId;
-    if (currentRole == AQUA_RESERV_PRO) {
-        doc["payload"]["level"] = lastIsFullState ? "FULL" : "EMPTY";
-    } else if (currentRole == WELLGUARD_PRO) {
-        doc["payload"]["pump"] = pumpOn ? "ON" : "OFF";
-        doc["payload"]["fault"] = lastFaultState;
+    if (_currentRole == AQUA_RESERV_PRO) {
+        doc["isFull"] = _isFull;
+    } else if (_currentRole == WELLGUARD_PRO) {
+        doc["pumpOn"] = _pumpOn;
+        doc["fault"] = _faultActive;
     }
-    loraSend(doc);
+    _lora.send(doc);
 }
 
-void checkFillingLogic() {
-    for (auto const& [wellId, reservoirIds] : wellAssignments) {
-        bool shouldPumpBeOn = false;
-        for (const String& reservoirId : reservoirIds) {
-            if (managedDevices.count(reservoirId) && !managedDevices.at(reservoirId).isFull) {
-                shouldPumpBeOn = true;
-                break;
-            }
-        }
-
-        if (managedDevices.count(wellId)) {
-            if (managedDevices.at(wellId).faultActive) {
-                shouldPumpBeOn = false;
-            }
-            if (shouldPumpBeOn != managedDevices.at(wellId).pumpOn) {
-                sendPumpCommand(wellId, shouldPumpBeOn);
-            }
-        }
-    }
-}
-
-void sendPumpCommand(const String& wellId, bool turnOn) {
+void DeviceManager::sendPumpCommand(const String& wellId, bool turnOn) {
     JsonDocument doc;
+    doc["from"] = _deviceId;
+    doc["to"] = wellId;
     doc["type"] = "COMMAND";
-    doc["id"] = deviceId;
-    doc["payload"]["action"] = turnOn ? "PUMP_ON" : "PUMP_OFF";
-    doc["payload"]["target"] = wellId;
-    loraSend(doc);
+    doc["command"] = turnOn ? "PUMP_ON" : "PUMP_OFF";
+    _lora.send(doc);
+}
+
+
+void DeviceManager::handleDiscovery(JsonDocument& doc) {
+    if (_currentRole != HYDRO_CONTROL_GE) return;
+
+    String id = doc["from"];
+    if (_managedDevices.find(id) == _managedDevices.end()) {
+        Device newDevice;
+        newDevice.id = id;
+        newDevice.name = doc["name"].as<String>();
+        newDevice.role = (DeviceRole)doc["role"].as<int>();
+        newDevice.lastSeen = millis();
+        _managedDevices[id] = newDevice;
+
+        JsonDocument ack;
+        ack["from"] = _deviceId;
+        ack["to"] = id;
+        ack["type"] = "DISCOVERY_ACK";
+        _lora.send(ack);
+    }
+}
+
+void DeviceManager::handleDiscoveryAck(JsonDocument& doc) {
+    if (doc["to"] == _deviceId) {
+        _discovered = true;
+    }
+}
+
+void DeviceManager::handleHeartbeat(JsonDocument& doc) {
+    String id = doc["from"];
+    if (_managedDevices.count(id)) {
+        _managedDevices[id].lastSeen = millis();
+    }
+}
+
+void DeviceManager::handleStatus(JsonDocument& doc) {
+    String id = doc["from"];
+    if (_managedDevices.count(id)) {
+        Device& dev = _managedDevices[id];
+        dev.lastSeen = millis();
+        if (dev.role == AQUA_RESERV_PRO) {
+            dev.level = doc["isFull"] ? LEVEL_FULL : LEVEL_EMPTY;
+        } else if (dev.role == WELLGUARD_PRO) {
+            dev.pumpOn = doc["pumpOn"];
+            dev.faultActive = doc["fault"];
+        }
+    }
+}
+
+void DeviceManager::handleCommand(JsonDocument& doc) {
+    if (_currentRole != WELLGUARD_PRO || doc["to"].as<String>() != _deviceId) return;
+    String command = doc["command"];
+    if (command == "PUMP_ON") {
+        digitalWrite(ROLE_PIN_1, HIGH);
+    } else if (command == "PUMP_OFF") {
+        digitalWrite(ROLE_PIN_1, LOW);
+    }
+}
+
+void DeviceManager::handleManualFillRequest(JsonDocument& doc) {
+    if (_currentRole != HYDRO_CONTROL_GE) return;
+    String reservoirId = doc["from"];
+    // The logic will trigger the pump via runSmartPumpLogic
+}
+
+void DeviceManager::handleCriticalFault(JsonDocument& doc) {
+    if (_currentRole != HYDRO_CONTROL_GE) return;
+    String wellId = doc["from"];
+    if (_managedDevices.count(wellId)) {
+        _managedDevices[wellId].faultActive = true;
+        _managedDevices[wellId].pumpOn = false;
+        // Also need to send PUMP_OFF command for safety
+        sendPumpCommand(wellId, false);
+    }
+}
+
+void DeviceManager::loadAssignments() {
+    Preferences prefs;
+    prefs.begin("assignments", true);
+    String assignmentsStr = prefs.getString("json", "{}");
+    prefs.end();
+
+    JsonDocument doc;
+    deserializeJson(doc, assignmentsStr);
+    for (JsonPairConst kvp : doc.as<JsonObjectConst>()) {
+        String wellId = kvp.key().c_str();
+        for (JsonVariantConst reservoirId : kvp.value().as<JsonArrayConst>()) {
+            assignReservoirToWell(reservoirId.as<String>(), wellId);
+        }
+    }
+}
+
+void DeviceManager::saveAssignments() {
+    JsonDocument doc;
+    for (auto const& [wellId, wellDevice] : _managedDevices) {
+        if (wellDevice.role == WELLGUARD_PRO) {
+            JsonArray arr = doc.to<JsonObject>()[wellId].to<JsonArray>();
+            for (auto const& reservoirId : wellDevice.assignedReservoirIds) {
+                arr.add(reservoirId);
+            }
+        }
+    }
+    String assignmentsStr;
+    serializeJson(doc, assignmentsStr);
+
+    Preferences prefs;
+    prefs.begin("assignments", false);
+    prefs.putString("json", assignmentsStr);
+    prefs.end();
+}
+
+void DeviceManager::assignReservoirToWell(const String& reservoirId, const String& wellId) {
+    if (_managedDevices.count(wellId) && _managedDevices.count(reservoirId)) {
+        _managedDevices[wellId].assignedReservoirIds.push_back(reservoirId);
+        _managedDevices[reservoirId].assignedWellId = wellId;
+    }
 }
