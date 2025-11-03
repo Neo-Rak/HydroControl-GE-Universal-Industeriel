@@ -10,12 +10,12 @@ public:
     void updateCredentials(const String& server, int port, const String& token);
     void sendTelemetry(const String& deviceName, const JsonDocument& data);
 
-    bool isEnabled() const { return enabled; }
+    bool isEnabled() const;
     void setEnabled(bool en);
 
-    String getServer() const { return tb_server; }
-    int getPort() const { return tb_port; }
-    String getToken() const { return tb_token; }
+    String getServer() const;
+    int getPort() const;
+    String getToken() const;
 
 private:
     void reconnect();

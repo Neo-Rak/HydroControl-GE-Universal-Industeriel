@@ -36,7 +36,7 @@ Communication between modules is handled by a secure, encrypted LoRa network. Ea
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/HydroControl-GE/Universal-Industeriel.git
+    git clone https://github.com/Neo-Rak/HydroControl-GE-Universal-Industeriel.git
     ```
 2.  **Open in PlatformIO:**
     Open the cloned folder in Visual Studio Code. PlatformIO should automatically recognize it as a project.
