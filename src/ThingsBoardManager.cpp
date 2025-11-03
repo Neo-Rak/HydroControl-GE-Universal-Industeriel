@@ -90,12 +90,12 @@ void ThingsBoardManager::sendTelemetry(const String& deviceName, const JsonDocum
     }
 
     JsonDocument doc;
-    JsonObject deviceData = doc.createNestedObject(deviceName);
-    JsonArray ts_values = deviceData.createNestedArray("ts");
+    JsonObject deviceData = doc.to<JsonObject>()[deviceName].to<JsonObject>();
+    JsonArray ts_values = deviceData["ts"].to<JsonArray>();
 
-    JsonObject ts_obj = ts_values.createNestedObject();
+    JsonObject ts_obj = ts_values.add<JsonObject>();
     ts_obj["ts"] = millis(); // Add timestamp
-    JsonObject values_obj = ts_obj.createNestedObject("values");
+    JsonObject values_obj = ts_obj["values"].to<JsonObject>();
 
     // Copy data to the 'values' object
     for (JsonPairConst kvp : data.as<JsonObjectConst>()) {

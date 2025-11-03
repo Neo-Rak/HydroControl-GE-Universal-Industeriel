@@ -1,75 +1,74 @@
-#include <Arduino.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoJson.h>
 #include "WebServerManager.h"
+#include "config.h"
+#include "types.h"
+#include <ArduinoJson.h>
 #include <map>
 #include <vector>
+#include "ThingsBoardManager.h"
 
-// --- Extern Global Variables from main.cpp ---
-extern enum DeviceRole currentRole;
-extern String deviceName;
+// --- Externs from main.cpp ---
+extern DeviceRole currentRole;
 extern String deviceId;
+extern String deviceName;
 extern std::map<String, Device> managedDevices;
 extern std::map<String, std::vector<String>> wellAssignments;
-extern SemaphoreHandle_t sharedDataMutex;
-extern bool isFull, pumpOn, faultActive;
-extern class ThingsBoardManager tbManager;
+extern bool discovered;
+extern ThingsBoardManager tbManager;
+extern bool pumpOn;
+extern bool isFull;
+extern bool faultActive;
 
-// --- Forward Declarations from main.cpp ---
-extern void sendPumpCommand(const String& wellId, bool turnOn);
+// --- Function Pointers ---
 extern void loraSend(JsonDocument& doc);
-extern void updateWebUI();
+extern void sendPumpCommand(const String& wellId, bool turnOn);
 
 
-WebManager::WebManager() : server(80), ws("/ws") {}
+WebServerManager::WebServerManager() : server(80), ws("/ws") {}
 
-void WebManager::begin() {
-    ws.onEvent(std::bind(&WebManager::onWsEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+void WebServerManager::begin() {
+    ws.onEvent(std::bind(&WebServerManager::onWsEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
     server.addHandler(&ws);
     setupWebServer();
     server.begin();
 }
 
-void WebManager::notifyClients() {
+void WebServerManager::notifyClients() {
     JsonDocument doc;
     doc["type"] = "STATE_UPDATE";
 
-    if (xSemaphoreTake(sharedDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (currentRole == HYDRO_CONTROL_GE) {
-            JsonArray devices = doc.createNestedArray("devices");
-            for (auto const& [id, device] : managedDevices) {
-                JsonObject d = devices.createNestedObject();
-                d["id"] = id;
-                d["name"] = device.name;
-                d["role"] = (device.role == AQUA_RESERV_PRO) ? "AquaReservPro" : "WellguardPro";
-                d["lastSeen"] = (millis() - device.lastSeen) / 1000;
-                if (device.role == AQUA_RESERV_PRO) d["isFull"] = device.isFull;
-                if (device.role == WELLGUARD_PRO) {
-                    d["pumpOn"] = device.pumpOn;
-                    d["faultActive"] = device.faultActive;
-                }
-            }
-            JsonObject assignments = doc.createNestedObject("assignments");
-            for (auto const& [wellId, reservoirs] : wellAssignments) {
-                JsonArray r_ids = assignments.createNestedArray(wellId);
-                for(const String& r_id : reservoirs) {
-                    r_ids.add(r_id);
-                }
-            }
-            JsonObject tb = doc.createNestedObject("tb");
-            tb["server"] = tbManager.getServer();
-            tb["port"] = tbManager.getPort();
-            tb["token"] = tbManager.getToken();
-            tb["enabled"] = tbManager.isEnabled();
-        } else { // Peripherals
-            doc["deviceId"] = deviceId;
-            if(currentRole == AQUA_RESERV_PRO) doc["isFull"] = isFull;
-            if(currentRole == WELLGUARD_PRO) {
-                doc["pumpOn"] = pumpOn;
-                doc["faultActive"] = faultActive;
+    if (currentRole == HYDRO_CONTROL_GE) {
+        JsonArray devices = doc["devices"].to<JsonArray>();
+        for (auto const& [id, device] : managedDevices) {
+            JsonObject d = devices.add<JsonObject>();
+            d["id"] = id;
+            d["name"] = device.name;
+            d["role"] = (device.role == AQUA_RESERV_PRO) ? "AquaReservPro" : "WellguardPro";
+            d["lastSeen"] = (millis() - device.lastSeen) / 1000;
+            if (device.role == AQUA_RESERV_PRO) d["isFull"] = device.isFull;
+            if (device.role == WELLGUARD_PRO) {
+                d["pumpOn"] = device.pumpOn;
+                d["faultActive"] = device.faultActive;
             }
         }
-        xSemaphoreGive(sharedDataMutex);
+        JsonObject assignments = doc["assignments"].to<JsonObject>();
+        for (auto const& [wellId, reservoirs] : wellAssignments) {
+            JsonArray r_ids = assignments[wellId].to<JsonArray>();
+            for(const String& r_id : reservoirs) {
+                r_ids.add(r_id);
+            }
+        }
+        JsonObject tb = doc["tb"].to<JsonObject>();
+        tb["server"] = tbManager.getServer();
+        tb["port"] = tbManager.getPort();
+        tb["token"] = tbManager.getToken();
+        tb["enabled"] = tbManager.isEnabled();
+    } else { // Peripherals
+        doc["deviceId"] = deviceId;
+        if(currentRole == AQUA_RESERV_PRO) doc["isFull"] = isFull;
+        if(currentRole == WELLGUARD_PRO) {
+            doc["pumpOn"] = pumpOn;
+            doc["faultActive"] = faultActive;
+        }
     }
 
     String jsonString;
@@ -77,8 +76,7 @@ void WebManager::notifyClients() {
     ws.textAll(jsonString);
 }
 
-
-void WebManager::setupWebServer() {
+void WebServerManager::setupWebServer() {
     server.on("/", HTTP_GET, [this](AsyncWebServerRequest *request) {
         String html = F(
             "<!DOCTYPE html><html><head><title>HydroControl - %ROLE%</title><meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -96,7 +94,6 @@ void WebManager::setupWebServer() {
                 "const send=(msg)=>ws.send(JSON.stringify(msg));"
                 "const render=(data)=>{if(data.type!=='STATE_UPDATE')return;const c=document.getElementById('content');"
                 "if(data.devices){c.innerHTML=renderCentral(data)}else{c.innerHTML=renderPeripheral(data)}};"
-                // Render functions will be inserted here by C++
                 "%RENDER_SCRIPT%"
             "</script></body></html>"
         );
@@ -196,9 +193,6 @@ void WebManager::setupWebServer() {
                     }
                 )JS";
                 break;
-            default:
-                roleStr = "N/A";
-                renderScript = "const renderPeripheral=()=>`<p>Device not configured.</p>`;";
         }
 
         html.replace("%ROLE%", roleStr);
@@ -208,40 +202,40 @@ void WebManager::setupWebServer() {
     });
 }
 
-
-void WebManager::onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_CONNECT || (type == WS_EVT_DATA && deserializeJson((JsonDocument&)*arg, (char*)data).is<JsonObject>() && (*arg)["type"] == "GET_STATE")) {
-        notifyClients(); // Send full state on connect or request
-    } else if (type == WS_EVT_DATA) {
-        JsonDocument doc;
-        deserializeJson(doc, (char*)data);
-        String msgType = doc["type"];
-
-        if (msgType == "MANUAL_PUMP_TOGGLE" && currentRole == WELLGUARD_PRO) {
-            // This is a local action, handled in main loop
-        } else if (msgType == "MANUAL_FILL_REQUEST" && currentRole == AQUA_RESERV_PRO) {
-            JsonDocument req;
-            req["type"] = "MANUAL_FILL_REQUEST";
-            req["id"] = deviceId;
-            loraSend(req);
-        } else if (msgType == "FORCE_PUMP" && currentRole == HYDRO_CONTROL_GE) {
-            sendPumpCommand(doc["wellId"], doc["state"]);
-        } else if (msgType == "SAVE_ASSIGNMENTS" && currentRole == HYDRO_CONTROL_GE) {
-            if (xSemaphoreTake(sharedDataMutex, portMAX_DELAY) == pdTRUE) {
-                wellAssignments.clear();
-                for (JsonPairConst kv : doc["payload"].as<JsonObjectConst>()) {
-                    for (JsonVariantConst v : kv.value().as<JsonArrayConst>()) {
-                        wellAssignments[kv.key().c_str()].push_back(v.as<String>());
+void WebServerManager::onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_DATA) {
+        AwsFrameInfo *info = (AwsFrameInfo*)arg;
+        if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+            JsonDocument doc;
+            if (deserializeJson(doc, (const char*)data, len) == DeserializationError::Ok) {
+                String msgType = doc["type"];
+                if (msgType == "MANUAL_FILL_REQUEST" && currentRole == AQUA_RESERV_PRO) {
+                    JsonDocument req;
+                    req["type"] = "MANUAL_FILL_REQUEST";
+                    req["id"] = deviceId;
+                    loraSend(req);
+                } else if (msgType == "MANUAL_PUMP_TOGGLE" && currentRole == WELLGUARD_PRO) {
+                    pumpOn = !pumpOn;
+                    digitalWrite(ROLE_PIN_1, pumpOn ? HIGH : LOW);
+                } else if (msgType == "SAVE_TB_CONFIG" && currentRole == HYDRO_CONTROL_GE) {
+                    JsonObject payload = doc["payload"];
+                    tbManager.updateCredentials(payload["tb_server"], payload["tb_port"].as<int>(), payload["tb_token"]);
+                    tbManager.setEnabled(payload["tb_enabled"]);
+                    notifyClients();
+                } else if (msgType == "FORCE_PUMP" && currentRole == HYDRO_CONTROL_GE) {
+                    sendPumpCommand(doc["wellId"], doc["state"]);
+                } else if (msgType == "SAVE_ASSIGNMENTS" && currentRole == HYDRO_CONTROL_GE) {
+                    wellAssignments.clear();
+                    JsonObject payload = doc["payload"].as<JsonObject>();
+                    for (JsonPair kv : payload) {
+                        JsonArray reservoirs = kv.value().as<JsonArray>();
+                        for (JsonVariant v : reservoirs) {
+                            wellAssignments[kv.key().c_str()].push_back(v.as<String>());
+                        }
                     }
+                    notifyClients();
                 }
-                xSemaphoreGive(sharedDataMutex);
-                notifyClients(); // Push updated assignments to all clients
             }
-        } else if (msgType == "SAVE_TB_CONFIG" && currentRole == HYDRO_CONTROL_GE) {
-            JsonObject payload = doc["payload"];
-            tbManager.updateCredentials(payload["tb_server"], payload["tb_port"].as<int>(), payload["tb_token"]);
-            tbManager.setEnabled(payload["tb_enabled"]);
-            notifyClients();
         }
     }
 }

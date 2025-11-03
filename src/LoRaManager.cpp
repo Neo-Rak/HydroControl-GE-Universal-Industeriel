@@ -1,48 +1,51 @@
+#include "LoRaManager.h"
+#include "config.h"
 #include <LoRa.h>
 #include <Crypto.h>
 #include <AES.h>
 #include <string.h>
-#include "LoRaManager.h"
-#include "config.h"
+#include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // --- Static variables ---
 static LoRaMessageCallback messageCallback_static = nullptr;
-static std::vector<String> receivedPackets;
-static SemaphoreHandle_t packetMutex;
+static std::vector<uint8_t> rxBuffer;
+static SemaphoreHandle_t packetSemaphore;
 
 // --- AES-128 CBC Encryption ---
 static AES128 aes;
 static byte key[16];
-static byte iv[16]; // Initialization Vector
+static byte iv[16];
 
-void LoRaManager_onReceive(int packetSize) {
+void IRAM_ATTR LoRaManager_onReceive(int packetSize) {
     if (packetSize == 0) return;
-    String received = "";
-    while (LoRa.available()) {
-        received += (char)LoRa.read();
+
+    rxBuffer.clear();
+    for (int i = 0; i < packetSize; i++) {
+        rxBuffer.push_back(LoRa.read());
     }
 
-    if (xSemaphoreTake(packetMutex, portMAX_DELAY) == pdTRUE) {
-        receivedPackets.push_back(received);
-        xSemaphoreGive(packetMutex);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(packetSemaphore, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
     }
 }
 
 bool LoRaManager::begin() {
-    packetMutex = xSemaphoreCreateMutex();
+    packetSemaphore = xSemaphoreCreateBinary();
 
     LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
-    if (!LoRa.begin(433E6)) { // 433MHz frequency
-        Serial.println("Starting LoRa failed!");
+    if (!LoRa.begin(433E6)) {
         return false;
     }
 
-    // Setup AES encryption key
     strncpy((char*)key, LORA_ENCRYPTION_KEY, 16);
-    memset(iv, 0, 16); // Use a zero IV for simplicity. For higher security, a random or counter-based IV is better.
+    memset(iv, 0, 16);
     aes.setKey(key, 16);
 
-    // Set up the receive handler
     LoRa.onReceive(LoRaManager_onReceive);
     LoRa.receive();
 
@@ -64,42 +67,34 @@ void LoRaManager::setOnReceive(LoRaMessageCallback callback) {
 }
 
 void LoRaManager::loop() {
-    if (uxSemaphoreGetCount(packetMutex) > 0) { // Check if there are packets without blocking
-        String packet = "";
-        if (xSemaphoreTake(packetMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (!receivedPackets.empty()) {
-                packet = receivedPackets.front();
-                receivedPackets.erase(receivedPackets.begin());
-            }
-            xSemaphoreGive(packetMutex);
+    if (xSemaphoreTake(packetSemaphore, pdMS_TO_TICKS(10)) == pdTRUE) {
+        String received = "";
+        for (uint8_t byte : rxBuffer) {
+            received += (char)byte;
         }
 
-        if (packet.length() > 0 && messageCallback_static != nullptr) {
-            String decrypted = decrypt(packet);
-
+        if (messageCallback_static != nullptr) {
+            String decrypted = decrypt(received);
             JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, decrypted);
-            if (error) {
-                Serial.print(F("deserializeJson() failed: "));
-                Serial.println(error.c_str());
-                return;
+            if (deserializeJson(doc, decrypted) == DeserializationError::Ok) {
+                messageCallback_static(doc);
             }
-            messageCallback_static(doc);
         }
     }
 }
 
 String LoRaManager::encrypt(const String& plaintext) {
     int len = plaintext.length();
-    int paddedLen = len + (16 - (len % 16)); // Pad to multiple of 16
-    byte plain[paddedLen];
-    byte cipher[paddedLen];
+    int paddedLen = len + (16 - (len % 16));
+    std::vector<byte> plain(paddedLen);
+    std::vector<byte> cipher(paddedLen);
 
-    plaintext.getBytes(plain, paddedLen);
-    memset(plain + len, 0, paddedLen - len); // Zero padding
+    memcpy(plain.data(), plaintext.c_str(), len);
+    memset(plain.data() + len, 0, paddedLen - len);
 
+    aes.setKey(key, 16);
     aes.setIV(iv, 16);
-    aes.encrypt(cipher, plain, paddedLen);
+    aes.encrypt(cipher.data(), plain.data(), paddedLen);
 
     String encoded = "";
     for (int i = 0; i < paddedLen; i++) {
@@ -112,17 +107,18 @@ String LoRaManager::encrypt(const String& plaintext) {
 
 String LoRaManager::decrypt(const String& ciphertext) {
     int len = ciphertext.length() / 2;
-    if (len == 0) return "";
+    if (len == 0 || len % 16 != 0) return "";
 
-    byte cipher[len];
-    byte plain[len];
+    std::vector<byte> cipher(len);
+    std::vector<byte> plain(len);
 
     for (int i = 0; i < len; i++) {
         sscanf(ciphertext.substring(i*2, i*2+2).c_str(), "%02x", &cipher[i]);
     }
 
+    aes.setKey(key, 16);
     aes.setIV(iv, 16);
-    aes.decrypt(plain, cipher, len);
+    aes.decrypt(plain.data(), cipher.data(), len);
 
-    return String((char*)plain);
+    return String((char*)plain.data());
 }

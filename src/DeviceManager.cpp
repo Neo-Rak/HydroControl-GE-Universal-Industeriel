@@ -1,11 +1,11 @@
 #include "DeviceManager.h"
 #include "config.h"
+#include "types.h"
 #include <ArduinoJson.h>
 #include <map>
 #include <vector>
-#include "ThingsBoardManager.h" // Include for tbManager
+#include "ThingsBoardManager.h"
 
-// --- Externs from main.cpp ---
 extern DeviceRole currentRole;
 extern String deviceId;
 extern String deviceName;
@@ -13,12 +13,13 @@ extern std::map<String, Device> managedDevices;
 extern std::map<String, std::vector<String>> wellAssignments;
 extern bool discovered;
 extern ThingsBoardManager tbManager;
-extern bool pumpOn; // Physical state for peripherals
+extern bool pumpOn;
+extern bool isFull;
+extern bool faultActive;
 
-// --- Function Pointers ---
 extern void loraSend(JsonDocument& doc);
+extern void sendPumpCommand(const String& wellId, bool turnOn);
 
-// --- Local State ---
 static unsigned long lastHeartbeatSent = 0;
 static unsigned long lastDiscoverySent = 0;
 static unsigned long lastButtonPress = 0;
@@ -29,7 +30,6 @@ static unsigned long lastLogicCheck = 0;
 
 void sendPeripheralStatusUpdate();
 void checkFillingLogic();
-void sendPumpCommand(const String& wellId, bool turnOn);
 
 void DeviceManager::begin() {
     setupRole();
@@ -95,7 +95,7 @@ void DeviceManager::handleLoraMessage(JsonDocument& doc) {
                     JsonDocument telemetry;
                     JsonObject payload = doc["payload"].as<JsonObject>();
                     for (JsonPair kv : payload) {
-                        telemetry[kv.key().as<String>()] = kv.value();
+                        telemetry[kv.key().c_str()] = kv.value();
                     }
                     tbManager.sendTelemetry(managedDevices[senderId].name, telemetry);
                 }
@@ -129,6 +129,7 @@ void DeviceManager::loopAquaReservPro() {
     bool currentFullState = (digitalRead(ROLE_PIN_1) == LOW);
     if (currentFullState != lastIsFullState) {
         lastIsFullState = currentFullState;
+        isFull = currentFullState;
         sendPeripheralStatusUpdate();
     }
 
@@ -164,6 +165,7 @@ void DeviceManager::loopWellguardPro() {
     bool currentFaultState = (digitalRead(ROLE_PIN_3) == LOW);
     if (currentFaultState && !lastFaultState) {
         lastFaultState = true;
+        faultActive = true;
         pumpOn = false;
         digitalWrite(ROLE_PIN_1, LOW);
         JsonDocument doc;
@@ -172,6 +174,7 @@ void DeviceManager::loopWellguardPro() {
         loraSend(doc);
     } else if (!currentFaultState && lastFaultState) {
         lastFaultState = false;
+        faultActive = false;
     }
 
     if (pumpOn != lastPumpOnState || lastFaultState != currentFaultState) {
@@ -214,17 +217,17 @@ void checkFillingLogic() {
     for (auto const& [wellId, reservoirIds] : wellAssignments) {
         bool shouldPumpBeOn = false;
         for (const String& reservoirId : reservoirIds) {
-            if (managedDevices.count(reservoirId) && !managedDevices[reservoirId].isFull) {
+            if (managedDevices.count(reservoirId) && !managedDevices.at(reservoirId).isFull) {
                 shouldPumpBeOn = true;
                 break;
             }
         }
 
         if (managedDevices.count(wellId)) {
-            if (managedDevices[wellId].faultActive) {
+            if (managedDevices.at(wellId).faultActive) {
                 shouldPumpBeOn = false;
             }
-            if (shouldPumpBeOn != managedDevices[wellId].pumpOn) {
+            if (shouldPumpBeOn != managedDevices.at(wellId).pumpOn) {
                 sendPumpCommand(wellId, shouldPumpBeOn);
             }
         }

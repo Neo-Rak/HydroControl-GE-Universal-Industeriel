@@ -3,9 +3,9 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-class WebManager {
+class WebServerManager {
 public:
-    WebManager();
+    WebServerManager();
     void begin();
     void notifyClients();
 
