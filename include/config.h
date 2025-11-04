@@ -1,8 +1,7 @@
 #pragma once
 
 // -- IDENTIFICATION ET SÉCURITÉ --
-// Clé de cryptage AES 128 bits (16 caractères) pour la communication LoRa
-#define LORA_ENCRYPTION_KEY "VotreCleSecrete16"
+// La clé de chiffrement est maintenant stockée en NVS
 
 // -- BROCHAGE MATÉRIEL COMMUN --
 // Module LoRa (RFM95/SX127x) - SPI

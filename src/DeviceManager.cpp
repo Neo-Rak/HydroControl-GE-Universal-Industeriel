@@ -9,6 +9,9 @@ DeviceManager::DeviceManager(LoRaManager& lora) : _lora(lora) {
     _discovered = false;
     _lastStatusSent = 0;
     _lastLogicCheck = 0;
+    _mutex = xSemaphoreCreateMutex();
+    _lastButtonPress = 0;
+    _buttonPressed = false;
 }
 
 void DeviceManager::begin() {
@@ -16,8 +19,14 @@ void DeviceManager::begin() {
     prefs.begin("hydro_config", true);
     _currentRole = (DeviceRole)prefs.getInt("role", ROLE_NOT_SET);
     _deviceName = prefs.getString("name", "");
-    _deviceId = WiFi.macAddress();
+    String loraKey = prefs.getString("loraKey", "");
     prefs.end();
+
+    if (loraKey.length() == 16) {
+        _lora.setEncryptionKey(loraKey.c_str());
+    }
+
+    _deviceId = WiFi.macAddress();
 
     if (_currentRole == HYDRO_CONTROL_GE) {
         loadAssignments();
@@ -25,11 +34,18 @@ void DeviceManager::begin() {
     setupRole();
 }
 
+DeviceRole DeviceManager::getRole() const {
+    return _currentRole;
+}
+
 void DeviceManager::loop() {
+    xSemaphoreTake(_mutex, portMAX_DELAY);
     loopRole();
+    xSemaphoreGive(_mutex);
 }
 
 void DeviceManager::processIncomingLoRaMessage(JsonDocument& doc) {
+    xSemaphoreTake(_mutex, portMAX_DELAY);
     String type = doc["type"];
     if (type == "DISCOVERY") handleDiscovery(doc);
     else if (type == "DISCOVERY_ACK") handleDiscoveryAck(doc);
@@ -38,6 +54,7 @@ void DeviceManager::processIncomingLoRaMessage(JsonDocument& doc) {
     else if (type == "COMMAND") handleCommand(doc);
     else if (type == "MANUAL_FILL_REQUEST") handleManualFillRequest(doc);
     else if (type == "CRITICAL_FAULT") handleCriticalFault(doc);
+    xSemaphoreGive(_mutex);
 }
 
 void DeviceManager::setupRole() {
@@ -91,14 +108,15 @@ void DeviceManager::loopAquaReservPro() {
         _lastStatusSent = millis();
     }
 
-    if (digitalRead(ROLE_PIN_2) == LOW) {
-        delay(50); // Debounce
-        if (digitalRead(ROLE_PIN_2) == LOW) {
-            JsonDocument doc;
-            doc["from"] = _deviceId;
-            doc["type"] = "MANUAL_FILL_REQUEST";
-            _lora.send(doc);
-        }
+    if (digitalRead(ROLE_PIN_2) == LOW && !_buttonPressed && (millis() - _lastButtonPress > 50)) {
+        _buttonPressed = true;
+        _lastButtonPress = millis();
+        JsonDocument doc;
+        doc["from"] = _deviceId;
+        doc["type"] = "MANUAL_FILL_REQUEST";
+        _lora.send(doc);
+    } else if (digitalRead(ROLE_PIN_2) == HIGH) {
+        _buttonPressed = false;
     }
 }
 
@@ -119,13 +137,14 @@ void DeviceManager::loopWellguardPro() {
         _lastStatusSent = millis();
     }
 
-    if (digitalRead(ROLE_PIN_2) == LOW) {
-        delay(50);
-        if (digitalRead(ROLE_PIN_2) == LOW) {
-            _pumpOn = !_pumpOn;
-            digitalWrite(ROLE_PIN_1, _pumpOn);
-            sendStatusUpdate();
-        }
+    if (digitalRead(ROLE_PIN_2) == LOW && !_buttonPressed && (millis() - _lastButtonPress > 50)) {
+        _buttonPressed = true;
+        _lastButtonPress = millis();
+        _pumpOn = !_pumpOn;
+        digitalWrite(ROLE_PIN_1, _pumpOn);
+        sendStatusUpdate();
+    } else if (digitalRead(ROLE_PIN_2) == HIGH) {
+        _buttonPressed = false;
     }
 }
 
@@ -140,7 +159,10 @@ void DeviceManager::loopCentrale() {
 void DeviceManager::checkDeviceTimeouts() {
     for (auto it = _managedDevices.begin(); it != _managedDevices.end(); ++it) {
         if (millis() - it->second.lastSeen > 900000) { // 15 minutes
-            // Mark device as disconnected
+            it->second.status = STATUS_DISCONNECTED;
+            if (it->second.role == AQUA_RESERV_PRO) {
+                it->second.level = LEVEL_UNKNOWN;
+            }
         }
     }
 }
@@ -148,9 +170,18 @@ void DeviceManager::checkDeviceTimeouts() {
 void DeviceManager::runSmartPumpLogic() {
     for (auto const& [wellId, wellDevice] : _managedDevices) {
         if (wellDevice.role == WELLGUARD_PRO) {
+            if (wellDevice.faultActive || wellDevice.status == STATUS_DISCONNECTED) {
+                if (wellDevice.pumpOn) {
+                    sendPumpCommand(wellId, false);
+                }
+                continue;
+            }
+
             bool shouldPump = false;
             for (auto const& reservoirId : wellDevice.assignedReservoirIds) {
-                 if (_managedDevices.count(reservoirId) && _managedDevices[reservoirId].level != LEVEL_FULL) {
+                 if (_managedDevices.count(reservoirId) &&
+                     _managedDevices[reservoirId].level == LEVEL_EMPTY &&
+                     _managedDevices[reservoirId].status == STATUS_OK) {
                     shouldPump = true;
                     break;
                 }
@@ -204,6 +235,7 @@ void DeviceManager::handleDiscovery(JsonDocument& doc) {
         newDevice.name = doc["name"].as<String>();
         newDevice.role = (DeviceRole)doc["role"].as<int>();
         newDevice.lastSeen = millis();
+        newDevice.status = STATUS_OK; // Initialize status
         _managedDevices[id] = newDevice;
 
         JsonDocument ack;
@@ -215,7 +247,7 @@ void DeviceManager::handleDiscovery(JsonDocument& doc) {
 }
 
 void DeviceManager::handleDiscoveryAck(JsonDocument& doc) {
-    if (doc["to"] == _deviceId) {
+    if (doc["to"].as<String>() == _deviceId) {
         _discovered = true;
     }
 }

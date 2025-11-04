@@ -34,6 +34,7 @@ void IRAM_ATTR LoRaManager_onReceive(int packetSize) {
 }
 
 bool LoRaManager::begin() {
+    _keyIsSet = false;
     rxQueue = xQueueCreate(10, sizeof(int));
 
     LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
@@ -42,7 +43,6 @@ bool LoRaManager::begin() {
     }
 
     mbedtls_aes_init(&aes_ctx);
-    mbedtls_aes_setkey_enc(&aes_ctx, (const unsigned char*)LORA_ENCRYPTION_KEY, 128);
 
     LoRa.onReceive(LoRaManager_onReceive);
     LoRa.receive();
@@ -50,14 +50,21 @@ bool LoRaManager::begin() {
     return true;
 }
 
+void LoRaManager::setEncryptionKey(const char* key) {
+    memcpy(_key, key, 16);
+    _keyIsSet = true;
+}
+
 void LoRaManager::send(JsonDocument& doc) {
     String jsonString;
     serializeJson(doc, jsonString);
     String encryptedString = encrypt(jsonString);
 
-    LoRa.beginPacket();
-    LoRa.print(encryptedString);
-    LoRa.endPacket();
+    if (encryptedString.length() > 0) {
+        LoRa.beginPacket();
+        LoRa.print(encryptedString);
+        LoRa.endPacket();
+    }
 }
 
 void LoRaManager::setOnReceive(LoRaMessageCallback callback) {
@@ -85,6 +92,10 @@ void LoRaManager::loop() {
 }
 
 String LoRaManager::encrypt(const String& plaintext) {
+    if (!_keyIsSet) return "";
+
+    mbedtls_aes_setkey_enc(&aes_ctx, _key, 128);
+
     unsigned char iv[16];
     esp_fill_random(iv, 16);
 
@@ -94,7 +105,6 @@ String LoRaManager::encrypt(const String& plaintext) {
 
     memcpy(padded_input, plaintext.c_str(), input_len);
 
-    // PKCS7 padding
     unsigned char padding_val = 16 - (input_len % 16);
     for(size_t i = input_len; i < padded_len; i++) {
         padded_input[i] = padding_val;
@@ -103,12 +113,10 @@ String LoRaManager::encrypt(const String& plaintext) {
     unsigned char encrypted[padded_len];
     mbedtls_aes_crypt_cbc(&aes_ctx, MBEDTLS_AES_ENCRYPT, padded_len, iv, padded_input, encrypted);
 
-    // IV + encrypted data
     unsigned char combined[16 + padded_len];
     memcpy(combined, iv, 16);
     memcpy(combined + 16, encrypted, padded_len);
 
-    // Base64 encode
     size_t encoded_len;
     mbedtls_base64_encode(NULL, 0, &encoded_len, combined, sizeof(combined));
     unsigned char encoded[encoded_len];
@@ -118,12 +126,14 @@ String LoRaManager::encrypt(const String& plaintext) {
 }
 
 String LoRaManager::decrypt(const String& ciphertext_b64) {
+    if (!_keyIsSet) return "";
+
     size_t decoded_len;
     mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char*)ciphertext_b64.c_str(), ciphertext_b64.length());
     unsigned char decoded[decoded_len];
-    mbedtls_base64_decode(decoded, decoded_len, &decoded_len, (const unsigned char*)ciphertext_b64.c_str(), ciphertext_b64.length());
+    int ret = mbedtls_base64_decode(decoded, decoded_len, &decoded_len, (const unsigned char*)ciphertext_b64.c_str(), ciphertext_b64.length());
 
-    if (decoded_len < 16) return "";
+    if (ret != 0 || decoded_len < 16) return "";
 
     unsigned char iv[16];
     memcpy(iv, decoded, 16);
@@ -138,11 +148,10 @@ String LoRaManager::decrypt(const String& ciphertext_b64) {
 
     mbedtls_aes_context dec_ctx;
     mbedtls_aes_init(&dec_ctx);
-    mbedtls_aes_setkey_dec(&dec_ctx, (const unsigned char*)LORA_ENCRYPTION_KEY, 128);
+    mbedtls_aes_setkey_dec(&dec_ctx, _key, 128);
     mbedtls_aes_crypt_cbc(&dec_ctx, MBEDTLS_AES_DECRYPT, encrypted_len, iv, encrypted, decrypted);
     mbedtls_aes_free(&dec_ctx);
 
-    // Unpadding
     unsigned char padding_val = decrypted[encrypted_len - 1];
     if(padding_val > 16) return "";
 

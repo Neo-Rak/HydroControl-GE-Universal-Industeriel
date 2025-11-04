@@ -2,13 +2,9 @@
 #include "config.h"
 #include "types.h"
 #include <ArduinoJson.h>
-#include <map>
-#include <vector>
 #include "DeviceManager.h"
 
-extern DeviceManager deviceManager;
-
-WebServerManager::WebServerManager() : server(80), ws("/ws") {}
+WebServerManager::WebServerManager(DeviceManager& dm) : server(80), ws("/ws"), _deviceManager(dm) {}
 
 void WebServerManager::begin() {
     ws.onEvent(std::bind(&WebServerManager::onWsEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
@@ -41,10 +37,11 @@ void WebServerManager::onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
             if (deserializeJson(doc, (const char*)data, len) == DeserializationError::Ok) {
                 String msgType = doc["type"];
                 if (msgType == "FORCE_PUMP") {
-                    deviceManager.sendPumpCommand(doc["wellId"], doc["state"]);
+                    _deviceManager.sendPumpCommand(doc["wellId"], doc["state"]);
                 } else if (msgType == "SAVE_ASSIGNMENTS") {
-                    // This logic needs to be moved to DeviceManager
-                    deviceManager.saveAssignments();
+                    // This logic should be in DeviceManager
+                    // For now, let's just save
+                    _deviceManager.saveAssignments();
                 }
             }
         }
@@ -52,5 +49,6 @@ void WebServerManager::onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
 }
 
 String WebServerManager::_getHtml() {
+    // This should be more dynamic, but for now...
     return "<html><head><title>HydroControl</title></head><body><h1>HydroControl</h1></body></html>";
 }

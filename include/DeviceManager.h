@@ -7,12 +7,15 @@
 #include <vector>
 #include "types.h"
 #include "LoRaManager.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class DeviceManager {
 public:
     DeviceManager(LoRaManager& lora);
     void begin();
     void loop();
+    DeviceRole getRole() const;
 
     void processIncomingLoRaMessage(JsonDocument& doc);
     void sendDiscovery();
@@ -44,6 +47,7 @@ private:
     DeviceRole _currentRole;
     String _deviceName;
     String _deviceId;
+    SemaphoreHandle_t _mutex;
 
     std::map<String, Device> _managedDevices;
 
@@ -51,6 +55,9 @@ private:
     bool _isFull;
     bool _pumpOn;
     bool _faultActive;
+    unsigned long _lastButtonPress;
+    bool _buttonPressed;
+
 
     // Network state
     bool _discovered;

@@ -18,6 +18,12 @@ enum ReservoirState {
     LEVEL_UNKNOWN
 };
 
+// Enum for device status
+enum DeviceStatus {
+    STATUS_OK,
+    STATUS_DISCONNECTED
+};
+
 // Data structure for managed devices
 struct Device {
     String id;
@@ -27,6 +33,7 @@ struct Device {
     ReservoirState level;
     bool pumpOn;
     bool faultActive;
+    DeviceStatus status;
     String assignedWellId;
     std::vector<String> assignedReservoirIds;
 };
